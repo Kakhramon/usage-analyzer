@@ -29,7 +29,15 @@ hook syncs automatically whenever a session ends — no command to remember.
 ## Server (one person runs this, once)
 
 ```bash
-python3 scripts/server.py --port 8080 --token SHARED_SECRET
+python3 scripts/server.py --port 8080 --token SHARED_SECRET --admin-token ADMIN_SECRET
+```
+
+Try it before anyone installs anything — `--demo` seeds four sample users with
+sessions and prompts so the dashboard has something to show:
+
+```bash
+python3 scripts/server.py --port 8080 --demo
+python3 scripts/seed_demo.py --clear   # drop the sample users later
 ```
 
 The dashboard is the root URL: `http://your-host:8080/`. Data lives in `usage.db`
@@ -37,10 +45,31 @@ beside `server.py`; override with `USAGE_DB=/path/usage.db`. Put it behind a rev
 proxy for TLS. Without `--token` anyone can post fake usage, so set one and give the
 same secret to everyone during setup.
 
+## Settings — change anything after deployment
+
+The **Settings** panel on the dashboard (needs `--admin-token`) writes to the server,
+and every collector reads it on its next sync. Nobody re-installs anything.
+
+| setting | what it does |
+|---|---|
+| `team_name` | the title on the dashboard |
+| `capture_prompts` | `off` (counts only, the default), `truncated`, or `full` prompt text |
+| `prompt_max_chars` | how much of each prompt to keep when truncated |
+| `retention_days` | delete sessions and prompts older than this; `0` keeps everything |
+
+Turning `capture_prompts` on makes collectors re-send the sessions they already
+sent, so history fills in rather than starting from today.
+
 ## What leaves the machine
 
-Counts only: session id, token totals, prompt and tool-call counts, timestamps, model
-names, and the project directory path. No prompt text, no file contents, no code.
+By default, counts only: session id, token totals, prompt and tool-call counts,
+timestamps, model names, and the project directory path — no prompt text, no file
+contents, no code.
+
+If the team turns on `capture_prompts`, what people typed is sent too, and shows up
+under each session on the dashboard. Credentials are stripped before sending either
+way — API keys, tokens, JWTs, AWS keys, private key blocks — and so are the
+`<system-reminder>` blocks the tools inject. Turn it on only if the team agreed to it.
 
 Logs read: `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`. Only
 files whose size or mtime changed since the last run are re-read, so a routine sync
@@ -54,7 +83,17 @@ double-counts.
 | `setup` | set your name and the dashboard URL, first sync |
 | `usage` | ask for your own or the team's numbers in chat, without opening the browser |
 
-## Dashboard columns
+## Dashboard
+
+Three levels, click through:
+
+1. **Everyone** — one row per person, sorted by tokens, with a plain-language note
+   when someone's numbers show an obvious problem.
+2. **A person** — their projects, then every session with its own token and cache
+   numbers.
+3. **A session** — the prompts, in order, when prompt capture is on.
+
+### Columns
 
 - **total tokens / share** — who is consuming the plan.
 - **tokens/prompt** — high means a huge context per ask; the usual cause is long

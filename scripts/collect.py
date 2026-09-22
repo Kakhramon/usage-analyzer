@@ -8,7 +8,7 @@ Usage:
     python3 collect.py --dry-run  # print what would be sent
     python3 collect.py --quiet    # hook mode: no output, never fails
 """
-import argparse, json, os, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, sys, time, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +19,40 @@ HELD_LOCK = False
 STALE_LOCK_SECONDS = 600
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 CODEX_DIR = Path.home() / ".codex" / "sessions"
+MAX_PROMPTS_PER_SESSION = 500
+
+# Credentials must never leave the machine, whatever the server asks for.
+SECRETS = [
+    re.compile(r"\b(sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9\-]{10,})"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bey[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+    re.compile(r"(?i)\b(?:bearer|api[_\-]?key|token|password|secret)\b\s*[:=]\s*\S{8,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+]
+NOISE = re.compile(r"<(system-reminder|command-[a-z-]+|local-command-[a-z-]+)>[\s\S]*?</\1>")
+
+
+def clean_prompt(text):
+    text = NOISE.sub("", text or "").strip()
+    for rx in SECRETS:
+        text = rx.sub("[redacted]", text)
+    return text
+
+
+def add_prompt(s, text, at):
+    s["prompts"] += 1
+    text = clean_prompt(text)
+    if text and len(s["prompt_texts"]) < MAX_PROMPTS_PER_SESSION:
+        s["prompt_texts"].append({"at": at, "chars": len(text), "text": text})
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") in ("text", "input_text"))
+    return ""
 
 
 def _ts(s):
@@ -36,6 +70,7 @@ def _blank(sid, tool, path):
         "models": set(), "prompts": 0, "assistant_turns": 0, "tool_calls": 0,
         "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
         "cache_write_tokens": 0, "reasoning_tokens": 0, "started_at": None, "ended_at": None,
+        "prompt_texts": [],
     }
 
 
@@ -65,7 +100,7 @@ def parse_claude(path):
             content = msg.get("content")
             blocks = content if isinstance(content, list) else []
             if not any(b.get("type") == "tool_result" for b in blocks if isinstance(b, dict)):
-                s["prompts"] += 1
+                add_prompt(s, text_of(content), d.get("timestamp"))
         elif d.get("type") == "assistant":
             s["assistant_turns"] += 1
             if msg.get("model"):
@@ -114,7 +149,7 @@ def parse_codex(path):
                 s["assistant_turns"] += 1
         elif kind == "response_item":
             if p.get("type") == "message" and p.get("role") == "user":
-                s["prompts"] += 1
+                add_prompt(s, text_of(p.get("content")), d.get("timestamp"))
             elif p.get("type") in ("function_call", "custom_tool_call", "local_shell_call"):
                 s["tool_calls"] += 1
     # codex counts input_tokens inclusive of cached ones
@@ -122,8 +157,8 @@ def parse_codex(path):
     return s
 
 
-def scan(state):
-    """Yield session dicts for log files whose (size, mtime) changed since last run."""
+def scan(state, capture="off", max_chars=500):
+    """Yield sessions for log files whose (size, mtime, capture mode) changed."""
     files = []
     if CLAUDE_DIR.is_dir():
         files += [(f, parse_claude) for f in CLAUDE_DIR.rglob("*.jsonl")]
@@ -134,7 +169,7 @@ def scan(state):
             st = path.stat()
         except OSError:
             continue
-        fp = f"{st.st_size}:{int(st.st_mtime)}"
+        fp = f"{st.st_size}:{int(st.st_mtime)}:{capture}:{max_chars}"
         if state.get(str(path)) == fp:
             continue
         try:
@@ -146,9 +181,26 @@ def scan(state):
             state[str(path)] = fp
             continue
         s["models"] = sorted(s["models"])
+        if capture == "off":
+            s["prompt_texts"] = []
+        elif capture == "truncated":
+            for t in s["prompt_texts"]:
+                t["text"] = t["text"][:max_chars]
         for k in ("started_at", "ended_at"):
             s[k] = datetime.fromtimestamp(s[k], timezone.utc).isoformat() if s[k] else None
         yield str(path), fp, s
+
+
+def fetch_settings(cfg):
+    """What the server wants collected. Unreachable server means collect nothing extra."""
+    req = urllib.request.Request(cfg["url"].rstrip("/") + "/api/config",
+                                 headers={"X-Token": cfg.get("token", "")})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            s = json.load(r)
+        return str(s.get("capture_prompts", "off")), int(s.get("prompt_max_chars", 500))
+    except (urllib.error.URLError, ValueError, KeyError, TimeoutError, OSError):
+        return "off", 500
 
 
 def push(cfg, sessions):
@@ -204,8 +256,9 @@ def main():
     cfg = json.loads(CONFIG.read_text())
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
 
+    capture, max_chars = fetch_settings(cfg)
     batch, marks = [], []
-    for path, fp, s in scan(state):
+    for path, fp, s in scan(state, capture, max_chars):
         batch.append(s)
         marks.append((path, fp))
         if len(batch) >= 50 and not a.dry_run:
@@ -222,7 +275,7 @@ def main():
             state[p] = f
     STATE.write_text(json.dumps(state))
     if not a.quiet:
-        print(f"synced, {len(state)} log files tracked")
+        print(f"synced ({capture} prompt capture), {len(state)} log files tracked")
 
 
 if __name__ == "__main__":

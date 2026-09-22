@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Usage dashboard: one URL, one sqlite file, no dependencies.
 
-    python3 server.py --port 8080 --token secret
+    python3 server.py --port 8080 --token secret [--admin-token other]
     open http://host:8080/
+
+Everything the collectors do is configured here, after deployment: the Settings
+panel on the dashboard writes to the settings table, and every collector reads it
+on its next sync.
 """
 import argparse, json, os, sqlite3, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,7 +15,8 @@ from pathlib import Path
 HERE = Path(__file__).parent
 DB = os.environ.get("USAGE_DB", str(HERE / "usage.db"))
 TOKEN = os.environ.get("USAGE_TOKEN", "")
-MAX_BODY = 8 << 20
+ADMIN_TOKEN = os.environ.get("USAGE_ADMIN_TOKEN", "")
+MAX_BODY = 32 << 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -26,22 +31,47 @@ CREATE TABLE IF NOT EXISTS sessions (
   PRIMARY KEY (user, session_id)
 );
 CREATE INDEX IF NOT EXISTS sessions_started ON sessions(started_at);
+CREATE TABLE IF NOT EXISTS prompts (
+  user TEXT NOT NULL, session_id TEXT NOT NULL, idx INTEGER NOT NULL,
+  at TEXT, chars INTEGER, text TEXT,
+  PRIMARY KEY (user, session_id, idx)
+);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+# Anything a collector or the dashboard may change after deployment.
+DEFAULTS = {
+    "capture_prompts": "off",      # off | truncated | full
+    "prompt_max_chars": "500",     # applies when capture_prompts = truncated
+    "retention_days": "0",         # 0 keeps everything
+    "team_name": "Usage Analyzer",
+}
+INT_KEYS = {"prompt_max_chars", "retention_days"}
+CAPTURE_MODES = {"off", "truncated", "full"}
 
 FIELDS = ["session_id", "tool", "project", "models", "prompts", "assistant_turns", "tool_calls",
           "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
           "reasoning_tokens", "started_at", "ended_at"]
 
-STATS_SQL = """
-SELECT user, tool,
-       COUNT(*) sessions, SUM(prompts) prompts, SUM(tool_calls) tool_calls,
+AGG = """SUM(prompts) prompts, SUM(tool_calls) tool_calls,
        SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens,
        SUM(cache_read_tokens) cache_read_tokens, SUM(cache_write_tokens) cache_write_tokens,
        SUM(reasoning_tokens) reasoning_tokens,
        SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) total_tokens,
        SUM(COALESCE(julianday(ended_at) - julianday(started_at), 0)) * 1440 active_minutes,
-       MAX(ended_at) last_seen
-FROM sessions WHERE started_at >= ? GROUP BY user, tool ORDER BY total_tokens DESC
+       MAX(ended_at) last_seen"""
+
+STATS_SQL = f"SELECT user, tool, COUNT(*) sessions, {AGG} FROM sessions " \
+            "WHERE started_at >= ? GROUP BY user, tool ORDER BY total_tokens DESC"
+PROJECTS_SQL = f"SELECT project, COUNT(*) sessions, {AGG} FROM sessions " \
+               "WHERE user = ? AND started_at >= ? GROUP BY project ORDER BY total_tokens DESC LIMIT 50"
+SESSIONS_SQL = """
+SELECT session_id, tool, project, models, prompts, assistant_turns, tool_calls,
+       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+       input_tokens + output_tokens + cache_read_tokens + cache_write_tokens total_tokens,
+       started_at, ended_at,
+       (SELECT COUNT(*) FROM prompts p WHERE p.user = s.user AND p.session_id = s.session_id) saved_prompts
+FROM sessions s WHERE user = ? AND started_at >= ? ORDER BY started_at DESC LIMIT 200
 """
 
 
@@ -52,12 +82,58 @@ def db():
     return c
 
 
+def get_settings(conn=None):
+    c = conn or db()
+    try:
+        s = dict(DEFAULTS)
+        s.update({r["key"]: r["value"] for r in c.execute("SELECT key, value FROM settings")})
+        for k in INT_KEYS:
+            s[k] = int(s[k])
+        return s
+    finally:
+        if conn is None:
+            c.close()
+
+
+def set_settings(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("settings must be an object")
+    clean = {}
+    for k, v in payload.items():
+        if k not in DEFAULTS:
+            raise ValueError(f"unknown setting: {k}")
+        if k in INT_KEYS:
+            v = int(v)
+            if v < 0 or v > 1_000_000:
+                raise ValueError(f"{k} out of range")
+        elif k == "capture_prompts":
+            if v not in CAPTURE_MODES:
+                raise ValueError("capture_prompts must be off, truncated or full")
+        else:
+            v = str(v)[:128]
+        clean[k] = str(v)
+    with db() as c:
+        c.executemany("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                      list(clean.items()))
+        return get_settings(c)
+
+
+def purge(conn):
+    days = get_settings(conn)["retention_days"]
+    if days <= 0:
+        return
+    cutoff = f"date('now', '-{int(days)} days')"
+    conn.execute(f"DELETE FROM prompts WHERE (user, session_id) IN "
+                 f"(SELECT user, session_id FROM sessions WHERE date(started_at) < {cutoff})")
+    conn.execute(f"DELETE FROM sessions WHERE date(started_at) < {cutoff}")
+
+
 def ingest(payload):
     user = str(payload.get("user", "")).strip()[:64]
     sessions = payload.get("sessions")
     if not user or not isinstance(sessions, list):
         raise ValueError("need user and sessions[]")
-    rows = []
+    rows, prompt_rows = [], []
     for s in sessions[:500]:
         if not isinstance(s, dict) or not s.get("session_id"):
             raise ValueError("session needs session_id")
@@ -72,20 +148,46 @@ def ingest(payload):
                 v = int(v or 0)
             r.append(v)
         rows.append(r)
+        for i, p in enumerate((s.get("prompt_texts") or [])[:500]):
+            if not isinstance(p, dict):
+                raise ValueError("prompt_texts entries must be objects")
+            prompt_rows.append([user, str(s["session_id"])[:512], i,
+                                str(p.get("at") or "")[:64], int(p.get("chars") or 0),
+                                str(p.get("text") or "")[:100_000]])
     cols = ", ".join(["user"] + FIELDS)
     marks = ", ".join("?" * (len(FIELDS) + 1))
     with db() as c:
         c.executemany(f"INSERT OR REPLACE INTO sessions ({cols}) VALUES ({marks})", rows)
-    return {"ok": True, "stored": len(rows)}
+        if prompt_rows:
+            c.executemany("INSERT OR REPLACE INTO prompts (user, session_id, idx, at, chars, text) "
+                          "VALUES (?, ?, ?, ?, ?, ?)", prompt_rows)
+        purge(c)
+    return {"ok": True, "stored": len(rows), "prompts_stored": len(prompt_rows)}
 
 
 def stats(since):
     with db() as c:
-        return {"by_user": [dict(r) for r in c.execute(STATS_SQL, (since,))]}
+        return {"by_user": [dict(r) for r in c.execute(STATS_SQL, (since,))],
+                "settings": get_settings(c)}
+
+
+def user_detail(user, since):
+    with db() as c:
+        return {"user": user,
+                "projects": [dict(r) for r in c.execute(PROJECTS_SQL, (user, since))],
+                "sessions": [dict(r) for r in c.execute(SESSIONS_SQL, (user, since))]}
+
+
+def session_prompts(user, session_id):
+    with db() as c:
+        return {"prompts": [dict(r) for r in c.execute(
+            "SELECT idx, at, chars, text FROM prompts WHERE user = ? AND session_id = ? ORDER BY idx",
+            (user, session_id))]}
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    server_version = "usage-analyzer"
 
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, (dict, list)):
@@ -98,27 +200,52 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _q(self, u, key, default=""):
+        return urllib.parse.parse_qs(u.query).get(key, [default])[0][:512]
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > MAX_BODY:
+            raise ValueError("bad body size")
+        return json.loads(self.rfile.read(n))
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
-        if u.path in ("/", "/index.html"):
-            return self._send(200, (HERE / "dashboard.html").read_bytes(), "text/html; charset=utf-8")
-        if u.path == "/api/stats":
-            since = urllib.parse.parse_qs(u.query).get("since", ["0000"])[0][:32]
-            return self._send(200, stats(since))
+        try:
+            if u.path in ("/", "/index.html"):
+                return self._send(200, (HERE / "dashboard.html").read_bytes(),
+                                  "text/html; charset=utf-8")
+            if u.path == "/api/stats":
+                return self._send(200, stats(self._q(u, "since", "0000")))
+            if u.path == "/api/user":
+                user = self._q(u, "user")
+                if not user:
+                    return self._send(400, {"error": "user required"})
+                return self._send(200, user_detail(user, self._q(u, "since", "0000")))
+            if u.path == "/api/prompts":
+                return self._send(200, session_prompts(self._q(u, "user"), self._q(u, "session")))
+            if u.path == "/api/config":
+                if TOKEN and self.headers.get("X-Token", "") != TOKEN:
+                    return self._send(401, {"error": "bad token"})
+                return self._send(200, get_settings())
+        except (ValueError, sqlite3.Error) as e:
+            return self._send(400, {"error": str(e)})
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if urllib.parse.urlparse(self.path).path != "/api/ingest":
-            return self._send(404, {"error": "not found"})
-        if TOKEN and self.headers.get("X-Token", "") != TOKEN:
-            return self._send(401, {"error": "bad token"})
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0 or n > MAX_BODY:
-            return self._send(413, {"error": "bad body size"})
+        path = urllib.parse.urlparse(self.path).path
         try:
-            self._send(200, ingest(json.loads(self.rfile.read(n))))
+            if path == "/api/ingest":
+                if TOKEN and self.headers.get("X-Token", "") != TOKEN:
+                    return self._send(401, {"error": "bad token"})
+                return self._send(200, ingest(self._body()))
+            if path == "/api/settings":
+                if self.headers.get("X-Admin-Token", "") != (ADMIN_TOKEN or TOKEN):
+                    return self._send(401, {"error": "bad admin token"})
+                return self._send(200, set_settings(self._body()))
         except (ValueError, TypeError, sqlite3.Error) as e:
-            self._send(400, {"error": str(e)})
+            return self._send(400, {"error": str(e)})
+        self._send(404, {"error": "not found"})
 
     def log_message(self, *a):
         pass
@@ -128,10 +255,16 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--token", default=TOKEN)
+    ap.add_argument("--token", default=TOKEN, help="shared secret every collector sends")
+    ap.add_argument("--admin-token", default=ADMIN_TOKEN,
+                    help="secret required to change settings (defaults to --token)")
+    ap.add_argument("--demo", action="store_true", help="seed sample data if the db is empty")
     a = ap.parse_args()
-    TOKEN = a.token
+    TOKEN, ADMIN_TOKEN = a.token, a.admin_token
     if not TOKEN:
         print("WARNING: no --token, anyone can post usage data")
+    if a.demo:
+        import seed_demo
+        seed_demo.seed()
     print(f"dashboard: http://{a.host}:{a.port}/   db: {DB}")
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()

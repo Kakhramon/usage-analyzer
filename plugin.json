@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "usage-analyzer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tracks how much of a shared Claude Max or Codex plan each teammate uses, and how well they use it, on one self-hosted dashboard.",
   "author": { "name": "kahero", "url": "https://github.com/kakhramon" },
   "homepage": "https://github.com/kakhramon/usage-analyzer",

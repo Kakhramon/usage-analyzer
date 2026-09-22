@@ -27,6 +27,7 @@ assert c["prompts"] == 1, c["prompts"]
 assert c["tool_calls"] == 1 and c["assistant_turns"] == 1
 assert c["output_tokens"] == 20 and c["cache_read_tokens"] == 100
 assert c["reasoning_tokens"] == 7 and c["models"] == {"claude-opus-5"}
+assert [t["text"] for t in c["prompt_texts"]] == ["hello"]
 
 codex = tmp / "rollout-x.jsonl"
 codex.write_text("\n".join(json.dumps(d) for d in [
@@ -34,7 +35,9 @@ codex.write_text("\n".join(json.dumps(d) for d in [
      "payload": {"session_id": "sess-1", "cwd": "/q"}},
     {"type": "turn_context", "timestamp": "2026-09-02T08:00:01Z", "payload": {"model": "gpt-5.6"}},
     {"type": "response_item", "timestamp": "2026-09-02T08:00:02Z",
-     "payload": {"type": "message", "role": "user"}},
+     "payload": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text",
+                              "text": "deploy it, my key is sk-abcdefghijklmnopqrst"}]}},
     {"type": "response_item", "timestamp": "2026-09-02T08:00:03Z",
      "payload": {"type": "function_call"}},
     {"type": "event_msg", "timestamp": "2026-09-02T08:10:00Z", "payload": {
@@ -63,5 +66,63 @@ for bad in [{"user": "", "sessions": []}, {"user": "a", "sessions": [{"tool": "c
         server.ingest(bad); raise SystemExit("bad payload accepted: %r" % bad)
     except ValueError:
         pass
+
+# prompt capture: secrets never leave, noise never arrives
+assert x["prompt_texts"][0]["text"] == "deploy it, my key is [redacted]", x["prompt_texts"]
+assert collect.clean_prompt("real ask<system-reminder>noise</system-reminder>") == "real ask"
+assert "[redacted]" in collect.clean_prompt("export AWS=AKIA1234567890ABCDEF")
+assert collect.clean_prompt("password: hunter2hunter2") == "[redacted]"
+
+# capture mode gates what scan() emits, and is part of the change fingerprint
+collect.CLAUDE_DIR, collect.CODEX_DIR = tmp, tmp / "none"
+got = {s["session_id"]: s for _, _, s in collect.scan({}, "off")}
+assert got["abc123"]["prompt_texts"] == []
+got = {s["session_id"]: s for _, _, s in collect.scan({}, "truncated", 3)}
+assert got["abc123"]["prompt_texts"][0]["text"] == "hel"
+state = {}
+fps = [fp for _, fp, _ in collect.scan(state, "off")]
+state.update({p: f for (p, f, _) in collect.scan({}, "off")})
+assert not list(collect.scan(state, "off")), "unchanged files re-sent"
+assert list(collect.scan(state, "full")), "capture change must re-send"
+
+# prompts are stored and readable per session
+sess2 = dict(sess, session_id="sess-2", prompt_texts=[
+    {"at": "2026-09-02T08:00:02+00:00", "chars": 5, "text": "hello"}])
+r = server.ingest({"user": "alice", "sessions": [sess2]})
+assert r["prompts_stored"] == 1, r
+got = server.session_prompts("alice", "sess-2")["prompts"]
+assert len(got) == 1 and got[0]["text"] == "hello"
+assert server.ingest({"user": "alice", "sessions": [sess2]})["prompts_stored"] == 1  # idempotent
+assert len(server.session_prompts("alice", "sess-2")["prompts"]) == 1
+
+# user drill-down
+d = server.user_detail("alice", "2026-01-01")
+assert len(d["sessions"]) == 2 and len(d["projects"]) == 1
+assert [s["saved_prompts"] for s in d["sessions"] if s["session_id"] == "sess-2"] == [1]
+
+# settings round-trip and validation
+assert server.get_settings()["capture_prompts"] == "off"
+assert server.set_settings({"capture_prompts": "full", "retention_days": 30})["retention_days"] == 30
+assert server.get_settings()["capture_prompts"] == "full"
+assert server.stats("2026-01-01")["settings"]["retention_days"] == 30
+for bad in [{"capture_prompts": "sometimes"}, {"nope": 1}, {"retention_days": -5}]:
+    try:
+        server.set_settings(bad); raise SystemExit("bad setting accepted: %r" % bad)
+    except ValueError:
+        pass
+
+# retention deletes old rows, and their prompts with them
+server.set_settings({"retention_days": 1})
+server.ingest({"user": "alice", "sessions": [dict(sess2, session_id="sess-3")]})
+assert not [s for s in server.user_detail("alice", "0000")["sessions"]], "old rows survived purge"
+assert not server.session_prompts("alice", "sess-2")["prompts"], "orphan prompts survived purge"
+server.set_settings({"retention_days": 0})
+
+# demo seed fills an empty dashboard
+import seed_demo
+assert seed_demo.seed(force=True) > 0
+assert any(r["user"].startswith("demo-") for r in server.stats("0000")["by_user"])
+seed_demo.clear()
+assert not any(r["user"].startswith("demo-") for r in server.stats("0000")["by_user"])
 
 print("ok")

@@ -3,87 +3,256 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Usage Analyzer</title>
 <style>
-:root{--bg:#fff;--fg:#111;--dim:#666;--line:#e3e3e3;--bar:#3b82f6;--card:#fafafa}
-@media(prefers-color-scheme:dark){:root{--bg:#111316;--fg:#e8e8e8;--dim:#9aa0a6;--line:#2a2e33;--bar:#60a5fa;--card:#181b1f}}
+:root{--bg:#fff;--fg:#111;--dim:#666;--line:#e3e3e3;--bar:#3b82f6;--card:#fafafa;--good:#16a34a;--warn:#d97706}
+@media(prefers-color-scheme:dark){:root{--bg:#111316;--fg:#e8e8e8;--dim:#9aa0a6;--line:#2a2e33;--bar:#60a5fa;--card:#181b1f;--good:#4ade80;--warn:#fbbf24}}
 *{box-sizing:border-box}
-body{margin:0;padding:24px 16px;background:var(--bg);color:var(--fg);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif}
-main{max-width:1100px;margin:0 auto}
-h1{font-size:20px;margin:0 0 4px}
-p.sub{color:var(--dim);margin:0 0 20px}
-select{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit}
-table{width:100%;border-collapse:collapse;margin-top:16px;font-variant-numeric:tabular-nums}
+body{margin:0;padding:24px 16px 64px;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif}
+main{max-width:1120px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+h1{font-size:20px;margin:0}
+h2{font-size:16px;margin:28px 0 0}
+p.sub{color:var(--dim);margin:0 0 18px}
+a{color:inherit}
+button,select,input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit}
+button{cursor:pointer}
+button:hover{border-color:var(--bar)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+table{width:100%;border-collapse:collapse;margin-top:14px;font-variant-numeric:tabular-nums}
 th,td{text-align:right;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 th:first-child,td:first-child{text-align:left}
-th{color:var(--dim);font-weight:500;font-size:13px;cursor:pointer}
+th{color:var(--dim);font-weight:500;font-size:13px;cursor:pointer;user-select:none}
+tbody tr[data-href]{cursor:pointer}
+tbody tr[data-href]:hover{background:var(--card)}
 .wrap{overflow-x:auto}
 .bar{height:6px;background:var(--bar);border-radius:3px;min-width:2px}
-.tool{font-size:12px;color:var(--dim)}
-.good{color:#16a34a}.warn{color:#d97706}
-.empty{color:var(--dim);padding:40px 0;text-align:center}
+.tool,.muted{font-size:12px;color:var(--dim)}
+.good{color:var(--good)}.warn{color:var(--warn)}
+.note{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--bar);border-radius:6px;padding:10px 12px;margin-top:14px;font-size:14px}
+.prompt{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px;white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+.prompt .meta{font:12px/1.4 ui-sans-serif,system-ui,sans-serif;color:var(--dim);margin-bottom:6px}
+dialog{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:20px;max-width:440px;width:92vw}
+dialog::backdrop{background:#0008}
+label{display:block;margin:12px 0 4px;font-size:13px;color:var(--dim)}
+label+input,label+select{width:100%}
+.empty{color:var(--dim);padding:48px 0;text-align:center}
+.err{color:#dc2626;margin-top:10px;font-size:13px}
 </style>
 <main>
-<h1>Usage Analyzer</h1>
-<p class="sub">Shared Claude Max / Codex usage across the team.</p>
-<select id="range">
-  <option value="7">last 7 days</option>
-  <option value="30" selected>last 30 days</option>
-  <option value="90">last 90 days</option>
-  <option value="3650">all time</option>
-</select>
-<div class="wrap"><table id="t"></table></div>
-<div id="empty" class="empty" hidden>No data yet. Run <code>python3 collect.py</code> on a machine.</div>
+<header>
+  <h1 id="title">Usage Analyzer</h1>
+  <span class="spacer"></span>
+  <select id="range">
+    <option value="7">last 7 days</option>
+    <option value="30" selected>last 30 days</option>
+    <option value="90">last 90 days</option>
+    <option value="3650">all time</option>
+  </select>
+  <button id="gear" title="Change what is collected">Settings</button>
+</header>
+<p class="sub" id="crumb"></p>
+<div id="view"></div>
 </main>
-<script>
-const n = x => (x||0).toLocaleString();
-const COLS = [
-  ['user','user', r=>`${r.user} <span class="tool">${r.tool}</span>`],
-  ['total tokens','total_tokens', r=>n(r.total_tokens)],
-  ['share','share', r=>`<div class="bar" style="width:${r.share}%"></div>`],
-  ['sessions','sessions', r=>n(r.sessions)],
-  ['prompts','prompts', r=>n(r.prompts)],
-  ['tokens/prompt','tpp', r=>n(Math.round(r.tpp))],
-  ['cache hit','cache', r=>`<span class="${r.cache>=70?'good':r.cache<40?'warn':''}">${r.cache.toFixed(0)}%</span>`],
-  ['tools/prompt','tools', r=>r.tools.toFixed(1)],
-  ['prompts/session','pps', r=>r.pps.toFixed(1)],
-  ['output tokens','output_tokens', r=>n(r.output_tokens)],
-  ['hours','hours', r=>r.hours.toFixed(1)],
-  ['last seen','last_seen', r=>(r.last_seen||'').slice(0,16).replace('T',' ')],
-];
-let sortKey='total_tokens', desc=true, rows=[];
 
-function derive(d){
-  const max = Math.max(1, ...d.by_user.map(r=>r.total_tokens));
-  return d.by_user.map(r=>{
-    const cached = r.cache_read_tokens, fresh = r.input_tokens + r.cache_write_tokens;
-    return Object.assign({}, r, {
-      share: 100*r.total_tokens/max,
-      tpp: r.prompts ? r.total_tokens/r.prompts : 0,
-      cache: (cached+fresh) ? 100*cached/(cached+fresh) : 0,
-      tools: r.prompts ? r.tool_calls/r.prompts : 0,
-      pps: r.sessions ? r.prompts/r.sessions : 0,
-      hours: (r.active_minutes||0)/60,
-    });
+<dialog id="settings">
+  <h2 style="margin-top:0">Settings</h2>
+  <p class="muted">Applies to everyone. Each collector reads this on its next sync.</p>
+  <label>Team name</label><input id="s_team">
+  <label>Save prompt text</label>
+  <select id="s_capture">
+    <option value="off">off — counts only</option>
+    <option value="truncated">truncated — first N characters</option>
+    <option value="full">full text</option>
+  </select>
+  <label>Truncate at (characters)</label><input id="s_chars" type="number" min="0">
+  <label>Delete data older than (days, 0 = keep forever)</label><input id="s_days" type="number" min="0">
+  <label>Admin token</label><input id="s_token" type="password" placeholder="the server's --admin-token">
+  <div class="err" id="s_err"></div>
+  <div class="row" style="margin-top:16px">
+    <span class="spacer"></span>
+    <button id="s_cancel">Cancel</button>
+    <button id="s_save">Save</button>
+  </div>
+</dialog>
+
+<script>
+const n = x => Math.round(x||0).toLocaleString();
+const pct = x => `<span class="${x>=70?'good':x<40?'warn':''}">${(x||0).toFixed(0)}%</span>`;
+const esc = s => String(s??'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const when = s => (s||'').slice(0,16).replace('T',' ');
+const el = id => document.getElementById(id);
+let SETTINGS = {}, sort = {key:'total_tokens', desc:true};
+
+function since(){
+  const d = +el('range').value;
+  return new Date(Date.now()-d*864e5).toISOString().slice(0,10);
+}
+const api = async (p) => (await fetch(p)).json();
+
+function metrics(r){
+  const cached = r.cache_read_tokens||0, fresh = (r.input_tokens||0)+(r.cache_write_tokens||0);
+  return Object.assign({}, r, {
+    tpp: r.prompts ? r.total_tokens/r.prompts : 0,
+    cache: (cached+fresh) ? 100*cached/(cached+fresh) : 0,
+    tools: r.prompts ? r.tool_calls/r.prompts : 0,
+    pps: r.sessions ? r.prompts/r.sessions : 0,
+    hours: (r.active_minutes||0)/60,
   });
 }
 
-function render(){
-  const t = document.getElementById('t');
-  document.getElementById('empty').hidden = rows.length > 0;
-  rows.sort((a,b)=>{const x=a[sortKey],y=b[sortKey];
-    const c = typeof x === 'string' ? String(x).localeCompare(String(y)) : (x-y); return desc?-c:c;});
-  t.innerHTML = '<tr>' + COLS.map(([h,k])=>`<th data-k="${k}">${h}</th>`).join('') + '</tr>'
-    + rows.map(r=>'<tr>'+COLS.map(([,,f])=>`<td>${f(r)}</td>`).join('')+'</tr>').join('');
-  t.querySelectorAll('th').forEach(th=>th.onclick=()=>{
-    const k=th.dataset.k; desc = k===sortKey ? !desc : true; sortKey=k; render();});
+function table(cols, rows, href){
+  rows = rows.slice().sort((a,b)=>{
+    const x=a[sort.key], y=b[sort.key];
+    if (x===undefined) return 0;
+    const c = typeof x === 'string' ? String(x).localeCompare(String(y)) : (x-y);
+    return sort.desc ? -c : c;
+  });
+  const html = '<div class="wrap"><table><thead><tr>'
+    + cols.map(c=>`<th data-k="${c[1]}">${c[0]}</th>`).join('')
+    + '</tr></thead><tbody>'
+    + rows.map(r=>`<tr ${href&&href(r)?`data-href="${href(r)}"`:''}>`
+        + cols.map(c=>`<td>${c[2](r)}</td>`).join('') + '</tr>').join('')
+    + '</tbody></table></div>';
+  return {html, rows};
 }
 
-async function load(){
-  const days = +document.getElementById('range').value;
-  const since = new Date(Date.now()-days*864e5).toISOString().slice(0,10);
-  const r = await fetch('/api/stats?since='+since);
-  rows = derive(await r.json());
-  render();
+function wire(){
+  document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    sort = {key:k, desc: k===sort.key ? !sort.desc : true};
+    render();
+  });
+  document.querySelectorAll('tr[data-href]').forEach(tr =>
+    tr.onclick = () => { location.hash = tr.dataset.href; });
 }
-document.getElementById('range').onchange = load;
-load();
+
+async function viewTeam(){
+  const d = await api('/api/stats?since='+since());
+  SETTINGS = d.settings || {};
+  el('title').textContent = SETTINGS.team_name || 'Usage Analyzer';
+  el('crumb').textContent = 'Everyone on the shared plan. Click a row for that person’s sessions.';
+  if (!d.by_user.length) {
+    el('view').innerHTML = '<div class="empty">No data yet. Run <code>collect.py</code> on a machine, '
+      + 'or <code>python3 seed_demo.py</code> for sample data.</div>';
+    return;
+  }
+  const rows = d.by_user.map(metrics);
+  const max = Math.max(1, ...rows.map(r=>r.total_tokens));
+  rows.forEach(r => r.share = 100*r.total_tokens/max);
+  const cols = [
+    ['user','user', r=>`${esc(r.user)} <span class="tool">${esc(r.tool)}</span>`],
+    ['total tokens','total_tokens', r=>n(r.total_tokens)],
+    ['share','share', r=>`<div class="bar" style="width:${r.share}%"></div>`],
+    ['sessions','sessions', r=>n(r.sessions)],
+    ['prompts','prompts', r=>n(r.prompts)],
+    ['tokens/prompt','tpp', r=>n(r.tpp)],
+    ['cache hit','cache', r=>pct(r.cache)],
+    ['tools/prompt','tools', r=>r.tools.toFixed(1)],
+    ['prompts/session','pps', r=>r.pps.toFixed(1)],
+    ['hours','hours', r=>r.hours.toFixed(1)],
+    ['last seen','last_seen', r=>when(r.last_seen)],
+  ];
+  const t = table(cols, rows, r=>`#/u/${encodeURIComponent(r.user)}`);
+  el('view').innerHTML = t.html + notes(t.rows);
+  wire();
+}
+
+function notes(rows){
+  const out = [];
+  const worst = rows.filter(r=>r.prompts>20).sort((a,b)=>a.cache-b.cache)[0];
+  if (worst && worst.cache < 40)
+    out.push(`<b>${esc(worst.user)}</b> reuses only ${worst.cache.toFixed(0)}% of context (${n(worst.tpp)} tokens per prompt). `
+      + 'That is the signature of restarting instead of continuing a session.');
+  const heavy = rows.slice().sort((a,b)=>b.tpp-a.tpp)[0];
+  if (heavy && heavy.tpp > 60000 && heavy.tools < 2)
+    out.push(`<b>${esc(heavy.user)}</b> carries ${n(heavy.tpp)} tokens per prompt but only ${heavy.tools.toFixed(1)} tool calls — `
+      + 'big context, little work per ask. Usually a session that should have been cleared.');
+  return out.map(s=>`<div class="note">${s}</div>`).join('');
+}
+
+async function viewUser(user){
+  const d = await api(`/api/user?user=${encodeURIComponent(user)}&since=${since()}`);
+  el('crumb').innerHTML = `<a href="#/">← everyone</a> &nbsp;·&nbsp; ${esc(user)}`;
+  const sessions = d.sessions.map(s=>metrics(Object.assign({sessions:1}, s)));
+  const projects = d.projects.map(p=>metrics(p));
+  const pcols = [
+    ['project','project', r=>esc(r.project||'(unknown)')],
+    ['sessions','sessions', r=>n(r.sessions)],
+    ['tokens','total_tokens', r=>n(r.total_tokens)],
+    ['prompts','prompts', r=>n(r.prompts)],
+    ['cache hit','cache', r=>pct(r.cache)],
+    ['hours','hours', r=>r.hours.toFixed(1)],
+  ];
+  const scols = [
+    ['started','started_at', r=>when(r.started_at)],
+    ['tool','tool', r=>esc(r.tool)],
+    ['project','project', r=>`<span class="muted">${esc((r.project||'').split('/').slice(-2).join('/'))}</span>`],
+    ['models','models', r=>`<span class="muted">${esc(r.models)}</span>`],
+    ['prompts','prompts', r=>n(r.prompts)],
+    ['tools','tool_calls', r=>n(r.tool_calls)],
+    ['tokens','total_tokens', r=>n(r.total_tokens)],
+    ['tokens/prompt','tpp', r=>n(r.tpp)],
+    ['cache hit','cache', r=>pct(r.cache)],
+    ['saved prompts','saved_prompts', r=>r.saved_prompts ? n(r.saved_prompts) : '<span class="muted">—</span>'],
+  ];
+  el('view').innerHTML =
+    '<h2>By project</h2>' + table(pcols, projects).html
+    + '<h2>Sessions</h2>'
+    + (sessions.length ? table(scols, sessions,
+        r=>`#/u/${encodeURIComponent(user)}/s/${encodeURIComponent(r.session_id)}`).html
+      : '<div class="empty">No sessions in this window.</div>')
+    + (SETTINGS.capture_prompts === 'off'
+      ? '<div class="note">Prompt text is not being saved. Turn it on in Settings if the team agreed to it.</div>' : '');
+  wire();
+}
+
+async function viewSession(user, sid){
+  const d = await api(`/api/prompts?user=${encodeURIComponent(user)}&session=${encodeURIComponent(sid)}`);
+  el('crumb').innerHTML = `<a href="#/">everyone</a> &nbsp;·&nbsp; `
+    + `<a href="#/u/${encodeURIComponent(user)}">${esc(user)}</a> &nbsp;·&nbsp; ${esc(sid)}`;
+  el('view').innerHTML = d.prompts.length
+    ? d.prompts.map(p=>`<div class="prompt"><div class="meta">#${p.idx+1} · ${when(p.at)} · ${n(p.chars)} chars</div>${esc(p.text)}</div>`).join('')
+    : '<div class="empty">No prompt text saved for this session.</div>';
+}
+
+async function render(){
+  const h = decodeURI(location.hash || '#/');
+  const m = h.match(/^#\/u\/([^/]+)(?:\/s\/(.+))?$/);
+  try {
+    if (m && m[2]) await viewSession(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+    else if (m) await viewUser(decodeURIComponent(m[1]));
+    else await viewTeam();
+  } catch (e) {
+    el('view').innerHTML = `<div class="empty">Could not load: ${esc(e.message)}</div>`;
+  }
+}
+
+// settings dialog
+el('gear').onclick = async () => {
+  const s = SETTINGS.capture_prompts ? SETTINGS : await api('/api/stats?since=9999').then(d=>d.settings||{});
+  el('s_team').value = s.team_name || '';
+  el('s_capture').value = s.capture_prompts || 'off';
+  el('s_chars').value = s.prompt_max_chars ?? 500;
+  el('s_days').value = s.retention_days ?? 0;
+  el('s_token').value = sessionStorage.getItem('ua_admin') || '';
+  el('s_err').textContent = '';
+  el('settings').showModal();
+};
+el('s_cancel').onclick = () => el('settings').close();
+el('s_save').onclick = async () => {
+  const token = el('s_token').value;
+  const body = {team_name: el('s_team').value, capture_prompts: el('s_capture').value,
+                prompt_max_chars: +el('s_chars').value, retention_days: +el('s_days').value};
+  const r = await fetch('/api/settings', {method:'POST',
+    headers:{'Content-Type':'application/json','X-Admin-Token':token}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!r.ok) { el('s_err').textContent = d.error || 'failed'; return; }
+  try { sessionStorage.setItem('ua_admin', token); } catch (e) {}
+  SETTINGS = d;
+  el('settings').close();
+  render();
+};
+el('range').onchange = render;
+addEventListener('hashchange', render);
+render();
 </script>
