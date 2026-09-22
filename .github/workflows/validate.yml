@@ -1,0 +1,37 @@
+name: validate
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: manifests are valid JSON
+        run: |
+          for f in plugin.json .claude-plugin/plugin.json .claude-plugin/marketplace.json \
+                   .codex-plugin/plugin.json .agents/plugins/marketplace.json hooks/hooks.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+      - name: versions agree
+        run: |
+          python3 - <<'PY'
+          import json
+          v = {p: json.load(open(p))["version"] for p in
+               ("plugin.json", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json")}
+          assert len(set(v.values())) == 1, v
+          print("version", set(v.values()).pop())
+          PY
+      - name: hook command points at a real script
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          cmd = json.load(open("hooks/hooks.json"))["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+          path = re.search(r'\$\{CLAUDE_PLUGIN_ROOT\}/([^"]+)', cmd).group(1)
+          assert pathlib.Path(path).is_file(), path
+          print("hook ->", path)
+          PY
+      - name: tests
+        run: python3 scripts/test_usage.py
