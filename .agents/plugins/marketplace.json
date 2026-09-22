@@ -1,0 +1,12 @@
+{
+  "name": "usage-analyzer",
+  "interface": { "displayName": "usage-analyzer" },
+  "plugins": [
+    {
+      "name": "usage-analyzer",
+      "source": { "source": "url", "url": "https://github.com/kakhramon/usage-analyzer.git", "ref": "main" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "usage-analyzer",
+  "description": "One dashboard for a shared Claude Max or Codex plan: who spent the tokens, and whether their sessions and prompts were worth it.",
+  "owner": { "name": "kahero", "url": "https://github.com/kakhramon" },
+  "plugins": [
+    {
+      "name": "usage-analyzer",
+      "source": "./",
+      "description": "Tracks how much of a shared Claude Max or Codex plan each teammate uses, and how well they use it, on one self-hosted dashboard.",
+      "category": "productivity",
+      "keywords": ["usage", "tokens", "team", "dashboard", "cost", "hooks"]
+    }
+  ]
+}

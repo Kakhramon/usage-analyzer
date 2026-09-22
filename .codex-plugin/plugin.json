@@ -1,0 +1,32 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "usage-analyzer",
+  "version": "0.1.0",
+  "description": "Tracks how much of a shared Claude Max or Codex plan each teammate uses, and how well they use it, on one self-hosted dashboard.",
+  "author": { "name": "kahero", "url": "https://github.com/kakhramon" },
+  "homepage": "https://github.com/kakhramon/usage-analyzer",
+  "repository": "https://github.com/kakhramon/usage-analyzer",
+  "license": "MIT",
+  "keywords": ["usage", "tokens", "team", "dashboard", "cost", "hooks"],
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json",
+      "skills": "./skills/",
+      "interface": {
+        "displayName": "usage-analyzer",
+        "shortDescription": "Team usage dashboard for a shared plan",
+        "longDescription": "Reads your local Claude Code and Codex session logs when a session ends and pushes counts only - tokens, prompts, timestamps - to a dashboard URL you host. Everyone on the shared plan sees who used what, and which sessions were run well.",
+        "developerName": "kahero",
+        "category": "Productivity",
+        "capabilities": ["Lifecycle hooks", "Skills"],
+        "websiteURL": "https://github.com/kakhramon/usage-analyzer",
+        "defaultPrompt": [
+          "Set up usage-analyzer with my name and our dashboard URL.",
+          "Show my usage for the last 7 days.",
+          "Who used the most tokens this month?"
+        ],
+        "brandColor": "#3b82f6"
+      }
+    }
+  }
+}

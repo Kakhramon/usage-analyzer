@@ -1,0 +1,10 @@
+{
+  "name": "usage-analyzer",
+  "version": "0.1.0",
+  "description": "Tracks how much of a shared Claude Max or Codex plan each teammate uses, and how well they use it, on one self-hosted dashboard.",
+  "author": { "name": "kahero", "url": "https://github.com/kakhramon" },
+  "homepage": "https://github.com/kakhramon/usage-analyzer",
+  "repository": "https://github.com/kakhramon/usage-analyzer",
+  "license": "MIT",
+  "keywords": ["usage", "tokens", "team", "dashboard", "cost", "hooks"]
+}
