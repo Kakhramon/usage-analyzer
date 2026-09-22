@@ -8,7 +8,7 @@ Usage:
     python3 collect.py --dry-run  # print what would be sent
     python3 collect.py --quiet    # hook mode: no output, never fails
 """
-import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import argparse, json, os, platform, re, sys, time, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -157,8 +157,8 @@ def parse_codex(path):
     return s
 
 
-def scan(state, capture="off", max_chars=500):
-    """Yield sessions for log files whose (size, mtime, capture mode) changed."""
+def scan(state):
+    """Yield session dicts for log files whose (size, mtime) changed since last run."""
     files = []
     if CLAUDE_DIR.is_dir():
         files += [(f, parse_claude) for f in CLAUDE_DIR.rglob("*.jsonl")]
@@ -169,7 +169,7 @@ def scan(state, capture="off", max_chars=500):
             st = path.stat()
         except OSError:
             continue
-        fp = f"{st.st_size}:{int(st.st_mtime)}:{capture}:{max_chars}"
+        fp = f"{st.st_size}:{int(st.st_mtime)}"
         if state.get(str(path)) == fp:
             continue
         try:
@@ -181,30 +181,14 @@ def scan(state, capture="off", max_chars=500):
             state[str(path)] = fp
             continue
         s["models"] = sorted(s["models"])
-        if capture == "off":
-            s["prompt_texts"] = []
-        elif capture == "truncated":
-            for t in s["prompt_texts"]:
-                t["text"] = t["text"][:max_chars]
         for k in ("started_at", "ended_at"):
             s[k] = datetime.fromtimestamp(s[k], timezone.utc).isoformat() if s[k] else None
         yield str(path), fp, s
 
 
-def fetch_settings(cfg):
-    """What the server wants collected. Unreachable server means collect nothing extra."""
-    req = urllib.request.Request(cfg["url"].rstrip("/") + "/api/config",
-                                 headers={"X-Token": cfg.get("token", "")})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            s = json.load(r)
-        return str(s.get("capture_prompts", "off")), int(s.get("prompt_max_chars", 500))
-    except (urllib.error.URLError, ValueError, KeyError, TimeoutError, OSError):
-        return "off", 500
-
-
 def push(cfg, sessions):
-    body = json.dumps({"user": cfg["name"], "sessions": sessions}).encode()
+    body = json.dumps({"user": cfg["name"], "machine": platform.node(),
+                       "sessions": sessions}).encode()
     req = urllib.request.Request(
         cfg["url"].rstrip("/") + "/api/ingest", data=body,
         headers={"Content-Type": "application/json", "X-Token": cfg.get("token", "")},
@@ -256,9 +240,8 @@ def main():
     cfg = json.loads(CONFIG.read_text())
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
 
-    capture, max_chars = fetch_settings(cfg)
     batch, marks = [], []
-    for path, fp, s in scan(state, capture, max_chars):
+    for path, fp, s in scan(state):
         batch.append(s)
         marks.append((path, fp))
         if len(batch) >= 50 and not a.dry_run:
@@ -275,7 +258,7 @@ def main():
             state[p] = f
     STATE.write_text(json.dumps(state))
     if not a.quiet:
-        print(f"synced ({capture} prompt capture), {len(state)} log files tracked")
+        print(f"synced, {len(state)} log files tracked")
 
 
 if __name__ == "__main__":

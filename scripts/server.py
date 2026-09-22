@@ -37,17 +37,17 @@ CREATE TABLE IF NOT EXISTS prompts (
   PRIMARY KEY (user, session_id, idx)
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users (
+  user TEXT PRIMARY KEY, first_seen TEXT, last_seen TEXT, last_sync TEXT, machine TEXT
+);
 """
 
 # Anything a collector or the dashboard may change after deployment.
 DEFAULTS = {
-    "capture_prompts": "off",      # off | truncated | full
-    "prompt_max_chars": "500",     # applies when capture_prompts = truncated
     "retention_days": "0",         # 0 keeps everything
     "team_name": "Usage Analyzer",
 }
-INT_KEYS = {"prompt_max_chars", "retention_days"}
-CAPTURE_MODES = {"off", "truncated", "full"}
+INT_KEYS = {"retention_days"}
 
 FIELDS = ["session_id", "tool", "project", "models", "prompts", "assistant_turns", "tool_calls",
           "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -61,17 +61,21 @@ AGG = """SUM(prompts) prompts, SUM(tool_calls) tool_calls,
        SUM(COALESCE(julianday(ended_at) - julianday(started_at), 0)) * 1440 active_minutes,
        MAX(ended_at) last_seen"""
 
+WINDOW = "started_at >= :since AND started_at < :until"
 STATS_SQL = f"SELECT user, tool, COUNT(*) sessions, {AGG} FROM sessions " \
-            "WHERE started_at >= ? GROUP BY user, tool ORDER BY total_tokens DESC"
+            f"WHERE {WINDOW} AND (:user = '' OR user = :user) " \
+            "GROUP BY user, tool ORDER BY total_tokens DESC"
 PROJECTS_SQL = f"SELECT project, COUNT(*) sessions, {AGG} FROM sessions " \
-               "WHERE user = ? AND started_at >= ? GROUP BY project ORDER BY total_tokens DESC LIMIT 50"
+               f"WHERE user = :user AND {WINDOW} " \
+               "GROUP BY project ORDER BY total_tokens DESC LIMIT 50"
 SESSIONS_SQL = """
 SELECT session_id, tool, project, models, prompts, assistant_turns, tool_calls,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        input_tokens + output_tokens + cache_read_tokens + cache_write_tokens total_tokens,
        started_at, ended_at,
        (SELECT COUNT(*) FROM prompts p WHERE p.user = s.user AND p.session_id = s.session_id) saved_prompts
-FROM sessions s WHERE user = ? AND started_at >= ? ORDER BY started_at DESC LIMIT 200
+FROM sessions s WHERE user = :user AND started_at >= :since AND started_at < :until
+ORDER BY started_at DESC LIMIT 200
 """
 
 
@@ -106,9 +110,6 @@ def set_settings(payload):
             v = int(v)
             if v < 0 or v > 1_000_000:
                 raise ValueError(f"{k} out of range")
-        elif k == "capture_prompts":
-            if v not in CAPTURE_MODES:
-                raise ValueError("capture_prompts must be off, truncated or full")
         else:
             v = str(v)[:128]
         clean[k] = str(v)
@@ -154,10 +155,21 @@ def ingest(payload):
             prompt_rows.append([user, str(s["session_id"])[:512], i,
                                 str(p.get("at") or "")[:64], int(p.get("chars") or 0),
                                 str(p.get("text") or "")[:100_000]])
+    machine = str(payload.get("machine") or "")[:128]
+    seen = [s.get("started_at") for s in sessions if s.get("started_at")]
+    first, last = (min(seen), max(seen)) if seen else (None, None)
     cols = ", ".join(["user"] + FIELDS)
     marks = ", ".join("?" * (len(FIELDS) + 1))
     with db() as c:
         c.executemany(f"INSERT OR REPLACE INTO sessions ({cols}) VALUES ({marks})", rows)
+        c.execute("""INSERT INTO users (user, first_seen, last_seen, last_sync, machine)
+                     VALUES (?, ?, ?, datetime('now'), ?)
+                     ON CONFLICT(user) DO UPDATE SET
+                       first_seen = MIN(COALESCE(first_seen, excluded.first_seen), excluded.first_seen),
+                       last_seen  = MAX(COALESCE(last_seen,  excluded.last_seen),  excluded.last_seen),
+                       last_sync  = excluded.last_sync,
+                       machine    = COALESCE(NULLIF(excluded.machine, ''), machine)""",
+                  (user, first, last, machine))
         if prompt_rows:
             c.executemany("INSERT OR REPLACE INTO prompts (user, session_id, idx, at, chars, text) "
                           "VALUES (?, ?, ?, ?, ?, ?)", prompt_rows)
@@ -165,17 +177,26 @@ def ingest(payload):
     return {"ok": True, "stored": len(rows), "prompts_stored": len(prompt_rows)}
 
 
-def stats(since):
+def window(since="", until="", user=""):
+    """Half-open [since, until). Empty ends mean unbounded."""
+    return {"since": since or "0000", "until": (until or "9999") + "~", "user": user or ""}
+
+
+def stats(since="", until="", user=""):
+    w = window(since, until, user)
     with db() as c:
-        return {"by_user": [dict(r) for r in c.execute(STATS_SQL, (since,))],
+        return {"by_user": [dict(r) for r in c.execute(STATS_SQL, w)],
+                "users": [dict(r) for r in c.execute(
+                    "SELECT user, first_seen, last_seen, last_sync, machine FROM users ORDER BY user")],
                 "settings": get_settings(c)}
 
 
-def user_detail(user, since):
+def user_detail(user, since="", until=""):
+    w = window(since, until, user)
     with db() as c:
         return {"user": user,
-                "projects": [dict(r) for r in c.execute(PROJECTS_SQL, (user, since))],
-                "sessions": [dict(r) for r in c.execute(SESSIONS_SQL, (user, since))]}
+                "projects": [dict(r) for r in c.execute(PROJECTS_SQL, w)],
+                "sessions": [dict(r) for r in c.execute(SESSIONS_SQL, w)]}
 
 
 def session_prompts(user, session_id):
@@ -216,12 +237,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, (HERE / "dashboard.html").read_bytes(),
                                   "text/html; charset=utf-8")
             if u.path == "/api/stats":
-                return self._send(200, stats(self._q(u, "since", "0000")))
+                return self._send(200, stats(self._q(u, "since"), self._q(u, "until"),
+                                             self._q(u, "user")))
             if u.path == "/api/user":
                 user = self._q(u, "user")
                 if not user:
                     return self._send(400, {"error": "user required"})
-                return self._send(200, user_detail(user, self._q(u, "since", "0000")))
+                return self._send(200, user_detail(user, self._q(u, "since"), self._q(u, "until")))
             if u.path == "/api/prompts":
                 return self._send(200, session_prompts(self._q(u, "user"), self._q(u, "session")))
             if u.path == "/api/config":

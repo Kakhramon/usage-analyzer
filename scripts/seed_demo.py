@@ -68,7 +68,8 @@ def seed(force=False):
                 "ended_at": (start + timedelta(minutes=minutes)).isoformat(),
                 "prompt_texts": texts,
             })
-        server.ingest({"user": user, "sessions": sessions})
+        server.ingest({"user": user, "machine": user.replace(PREFIX, "") + "-mbp",
+                       "sessions": sessions})
         total += len(sessions)
     print(f"seeded {total} sample sessions across {len(PEOPLE)} demo users")
     return total

@@ -75,15 +75,10 @@ assert collect.clean_prompt("password: hunter2hunter2") == "[redacted]"
 
 # capture mode gates what scan() emits, and is part of the change fingerprint
 collect.CLAUDE_DIR, collect.CODEX_DIR = tmp, tmp / "none"
-got = {s["session_id"]: s for _, _, s in collect.scan({}, "off")}
-assert got["abc123"]["prompt_texts"] == []
-got = {s["session_id"]: s for _, _, s in collect.scan({}, "truncated", 3)}
-assert got["abc123"]["prompt_texts"][0]["text"] == "hel"
-state = {}
-fps = [fp for _, fp, _ in collect.scan(state, "off")]
-state.update({p: f for (p, f, _) in collect.scan({}, "off")})
-assert not list(collect.scan(state, "off")), "unchanged files re-sent"
-assert list(collect.scan(state, "full")), "capture change must re-send"
+got = {s["session_id"]: s for _, _, s in collect.scan({})}
+assert got["abc123"]["prompt_texts"][0]["text"] == "hello"
+state = {p: f for (p, f, _) in collect.scan({})}
+assert not list(collect.scan(state)), "unchanged files re-sent"
 
 # prompts are stored and readable per session
 sess2 = dict(sess, session_id="sess-2", prompt_texts=[
@@ -100,12 +95,33 @@ d = server.user_detail("alice", "2026-01-01")
 assert len(d["sessions"]) == 2 and len(d["projects"]) == 1
 assert [s["saved_prompts"] for s in d["sessions"] if s["session_id"] == "sess-2"] == [1]
 
+# date window is half-open on since and inclusive on until
+assert len(server.stats("2026-09-02", "2026-09-02")["by_user"]) == 1, "until must include its own day"
+assert server.stats("2026-09-03")["by_user"] == []
+assert server.stats("", "2026-09-01")["by_user"] == []
+assert len(server.user_detail("alice", "2026-09-02", "2026-09-02")["sessions"]) == 2
+
+# user filter
+server.ingest({"user": "bob", "sessions": [dict(sess, session_id="b1")], "machine": "bob-mbp"})
+assert {r["user"] for r in server.stats("2026-01-01")["by_user"]} == {"alice", "bob"}
+assert {r["user"] for r in server.stats("2026-01-01", user="bob")["by_user"]} == {"bob"}
+
+# users are stored alongside their sessions
+users = {u["user"]: u for u in server.stats("2026-01-01")["users"]}
+assert set(users) == {"alice", "bob"}, users
+assert users["bob"]["machine"] == "bob-mbp" and users["bob"]["last_sync"]
+assert users["alice"]["first_seen"] == "2026-09-02T08:00:00+00:00"
+server.ingest({"user": "bob", "sessions": [dict(sess, session_id="b2",
+                                                started_at="2026-09-05T08:00:00+00:00")]})
+u = {x["user"]: x for x in server.stats("2026-01-01")["users"]}["bob"]
+assert u["first_seen"] == "2026-09-02T08:00:00+00:00", u   # earliest kept
+assert u["last_seen"] == "2026-09-05T08:00:00+00:00", u    # latest kept
+assert u["machine"] == "bob-mbp", u                        # not wiped by a sync without one
+
 # settings round-trip and validation
-assert server.get_settings()["capture_prompts"] == "off"
-assert server.set_settings({"capture_prompts": "full", "retention_days": 30})["retention_days"] == 30
-assert server.get_settings()["capture_prompts"] == "full"
+assert server.set_settings({"retention_days": 30})["retention_days"] == 30
 assert server.stats("2026-01-01")["settings"]["retention_days"] == 30
-for bad in [{"capture_prompts": "sometimes"}, {"nope": 1}, {"retention_days": -5}]:
+for bad in [{"capture_prompts": "full"}, {"nope": 1}, {"retention_days": -5}]:
     try:
         server.set_settings(bad); raise SystemExit("bad setting accepted: %r" % bad)
     except ValueError:
@@ -114,15 +130,15 @@ for bad in [{"capture_prompts": "sometimes"}, {"nope": 1}, {"retention_days": -5
 # retention deletes old rows, and their prompts with them
 server.set_settings({"retention_days": 1})
 server.ingest({"user": "alice", "sessions": [dict(sess2, session_id="sess-3")]})
-assert not [s for s in server.user_detail("alice", "0000")["sessions"]], "old rows survived purge"
+assert not [s for s in server.user_detail("alice")["sessions"]], "old rows survived purge"
 assert not server.session_prompts("alice", "sess-2")["prompts"], "orphan prompts survived purge"
 server.set_settings({"retention_days": 0})
 
 # demo seed fills an empty dashboard
 import seed_demo
 assert seed_demo.seed(force=True) > 0
-assert any(r["user"].startswith("demo-") for r in server.stats("0000")["by_user"])
+assert any(r["user"].startswith("demo-") for r in server.stats()["by_user"])
 seed_demo.clear()
-assert not any(r["user"].startswith("demo-") for r in server.stats("0000")["by_user"])
+assert not any(r["user"].startswith("demo-") for r in server.stats()["by_user"])
 
 print("ok")

@@ -53,23 +53,19 @@ and every collector reads it on its next sync. Nobody re-installs anything.
 | setting | what it does |
 |---|---|
 | `team_name` | the title on the dashboard |
-| `capture_prompts` | `off` (counts only, the default), `truncated`, or `full` prompt text |
-| `prompt_max_chars` | how much of each prompt to keep when truncated |
 | `retention_days` | delete sessions and prompts older than this; `0` keeps everything |
-
-Turning `capture_prompts` on makes collectors re-send the sessions they already
-sent, so history fills in rather than starting from today.
 
 ## What leaves the machine
 
-By default, counts only: session id, token totals, prompt and tool-call counts,
-timestamps, model names, and the project directory path — no prompt text, no file
-contents, no code.
+Session counts — token totals, prompt and tool-call counts, timestamps, model names,
+the project directory path, the machine name — and the full text of every prompt the
+person typed. No file contents, no code, no assistant replies.
 
-If the team turns on `capture_prompts`, what people typed is sent too, and shows up
-under each session on the dashboard. Credentials are stripped before sending either
-way — API keys, tokens, JWTs, AWS keys, private key blocks — and so are the
-`<system-reminder>` blocks the tools inject. Turn it on only if the team agreed to it.
+Credentials are stripped before anything is sent: API keys, `ghp_`/`xox` tokens, JWTs,
+AWS keys, `password:`/`token=` pairs and private key blocks all become `[redacted]`,
+along with the `<system-reminder>` blocks the tools inject. Everyone on the shared
+plan can read everyone's prompts on the dashboard, so put it behind your VPN or
+basic auth, and tell the team it is on.
 
 Logs read: `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`. Only
 files whose size or mtime changed since the last run are re-read, so a routine sync
@@ -88,10 +84,15 @@ double-counts.
 Three levels, click through:
 
 1. **Everyone** — one row per person, sorted by tokens, with a plain-language note
-   when someone's numbers show an obvious problem.
+   when someone's numbers show an obvious problem. Filter by date range (presets or
+   two date pickers) and by person; both apply to every level below.
 2. **A person** — their projects, then every session with its own token and cache
    numbers.
-3. **A session** — the prompts, in order, when prompt capture is on.
+3. **A session** — every prompt from it, in order, with timestamps.
+
+People are stored in a `users` table as they sync — first seen, last seen, last sync
+and machine name — so the person filter lists everyone on the plan even in a window
+where they did nothing.
 
 ### Columns
 

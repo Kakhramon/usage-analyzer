@@ -42,12 +42,16 @@ label+input,label+select{width:100%}
 <header>
   <h1 id="title">Usage Analyzer</h1>
   <span class="spacer"></span>
-  <select id="range">
+  <select id="preset">
     <option value="7">last 7 days</option>
     <option value="30" selected>last 30 days</option>
     <option value="90">last 90 days</option>
-    <option value="3650">all time</option>
+    <option value="0">all time</option>
+    <option value="custom">custom range</option>
   </select>
+  <input id="from" type="date" title="from (inclusive)">
+  <input id="to" type="date" title="to (inclusive)">
+  <select id="who"><option value="">everyone</option></select>
   <button id="gear" title="Change what is collected">Settings</button>
 </header>
 <p class="sub" id="crumb"></p>
@@ -56,15 +60,8 @@ label+input,label+select{width:100%}
 
 <dialog id="settings">
   <h2 style="margin-top:0">Settings</h2>
-  <p class="muted">Applies to everyone. Each collector reads this on its next sync.</p>
+  <p class="muted">Applies to everyone, straight away.</p>
   <label>Team name</label><input id="s_team">
-  <label>Save prompt text</label>
-  <select id="s_capture">
-    <option value="off">off — counts only</option>
-    <option value="truncated">truncated — first N characters</option>
-    <option value="full">full text</option>
-  </select>
-  <label>Truncate at (characters)</label><input id="s_chars" type="number" min="0">
   <label>Delete data older than (days, 0 = keep forever)</label><input id="s_days" type="number" min="0">
   <label>Admin token</label><input id="s_token" type="password" placeholder="the server's --admin-token">
   <div class="err" id="s_err"></div>
@@ -83,9 +80,21 @@ const when = s => (s||'').slice(0,16).replace('T',' ');
 const el = id => document.getElementById(id);
 let SETTINGS = {}, sort = {key:'total_tokens', desc:true};
 
-function since(){
-  const d = +el('range').value;
-  return new Date(Date.now()-d*864e5).toISOString().slice(0,10);
+function dates(){
+  return {since: el('from').value, until: el('to').value};
+}
+function q(extra){
+  const d = dates();
+  const p = new URLSearchParams(Object.assign({since: d.since, until: d.until}, extra || {}));
+  return p.toString();
+}
+function applyPreset(){
+  const v = el('preset').value;
+  if (v === 'custom') return;
+  const today = new Date();
+  el('to').value = today.toISOString().slice(0,10);
+  el('from').value = v === '0' ? ''
+    : new Date(Date.now() - (+v)*864e5).toISOString().slice(0,10);
 }
 const api = async (p) => (await fetch(p)).json();
 
@@ -127,7 +136,8 @@ function wire(){
 }
 
 async function viewTeam(){
-  const d = await api('/api/stats?since='+since());
+  const d = await api('/api/stats?' + q({user: el('who').value}));
+  fillUsers(d.users);
   SETTINGS = d.settings || {};
   el('title').textContent = SETTINGS.team_name || 'Usage Analyzer';
   el('crumb').textContent = 'Everyone on the shared plan. Click a row for that person’s sessions.';
@@ -157,6 +167,14 @@ async function viewTeam(){
   wire();
 }
 
+function fillUsers(users){
+  const sel = el('who'), keep = sel.value;
+  const names = (users || []).map(u => u.user);
+  sel.innerHTML = '<option value="">everyone</option>'
+    + names.map(u => `<option value="${esc(u)}">${esc(u)}</option>`).join('');
+  sel.value = names.includes(keep) ? keep : '';
+}
+
 function notes(rows){
   const out = [];
   const worst = rows.filter(r=>r.prompts>20).sort((a,b)=>a.cache-b.cache)[0];
@@ -171,7 +189,7 @@ function notes(rows){
 }
 
 async function viewUser(user){
-  const d = await api(`/api/user?user=${encodeURIComponent(user)}&since=${since()}`);
+  const d = await api('/api/user?' + q({user}));
   el('crumb').innerHTML = `<a href="#/">← everyone</a> &nbsp;·&nbsp; ${esc(user)}`;
   const sessions = d.sessions.map(s=>metrics(Object.assign({sessions:1}, s)));
   const projects = d.projects.map(p=>metrics(p));
@@ -201,8 +219,7 @@ async function viewUser(user){
     + (sessions.length ? table(scols, sessions,
         r=>`#/u/${encodeURIComponent(user)}/s/${encodeURIComponent(r.session_id)}`).html
       : '<div class="empty">No sessions in this window.</div>')
-    + (SETTINGS.capture_prompts === 'off'
-      ? '<div class="note">Prompt text is not being saved. Turn it on in Settings if the team agreed to it.</div>' : '');
+    ;
   wire();
 }
 
@@ -229,10 +246,8 @@ async function render(){
 
 // settings dialog
 el('gear').onclick = async () => {
-  const s = SETTINGS.capture_prompts ? SETTINGS : await api('/api/stats?since=9999').then(d=>d.settings||{});
+  const s = SETTINGS.team_name ? SETTINGS : await api('/api/stats').then(d=>d.settings||{});
   el('s_team').value = s.team_name || '';
-  el('s_capture').value = s.capture_prompts || 'off';
-  el('s_chars').value = s.prompt_max_chars ?? 500;
   el('s_days').value = s.retention_days ?? 0;
   el('s_token').value = sessionStorage.getItem('ua_admin') || '';
   el('s_err').textContent = '';
@@ -241,8 +256,7 @@ el('gear').onclick = async () => {
 el('s_cancel').onclick = () => el('settings').close();
 el('s_save').onclick = async () => {
   const token = el('s_token').value;
-  const body = {team_name: el('s_team').value, capture_prompts: el('s_capture').value,
-                prompt_max_chars: +el('s_chars').value, retention_days: +el('s_days').value};
+  const body = {team_name: el('s_team').value, retention_days: +el('s_days').value};
   const r = await fetch('/api/settings', {method:'POST',
     headers:{'Content-Type':'application/json','X-Admin-Token':token}, body: JSON.stringify(body)});
   const d = await r.json();
@@ -252,7 +266,10 @@ el('s_save').onclick = async () => {
   el('settings').close();
   render();
 };
-el('range').onchange = render;
+el('preset').onchange = () => { applyPreset(); render(); };
+el('who').onchange = () => { if (location.hash.startsWith('#/u/')) location.hash = '#/'; else render(); };
+for (const id of ['from','to']) el(id).onchange = () => { el('preset').value = 'custom'; render(); };
+applyPreset();
 addEventListener('hashchange', render);
 render();
 </script>
