@@ -84,8 +84,9 @@ double-counts.
 Three levels, click through:
 
 1. **Everyone** — one row per person, sorted by tokens, with a plain-language note
-   when someone's numbers show an obvious problem. Filter by date range (presets or
-   two date pickers) and by person; both apply to every level below.
+   when someone's numbers show an obvious problem. Filter by date range (a range picker
+   with presets, or click two days on its calendar) and by person; both apply to
+   every level below.
 2. **A person** — their projects, then every session with its own token and cache
    numbers.
 3. **A session** — every prompt from it, in order, with timestamps.

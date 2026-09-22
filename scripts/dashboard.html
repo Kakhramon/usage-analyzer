@@ -36,21 +36,56 @@ dialog::backdrop{background:#0008}
 label{display:block;margin:12px 0 4px;font-size:13px;color:var(--dim)}
 label+input,label+select{width:100%}
 .empty{color:var(--dim);padding:48px 0;text-align:center}
+.rangebox{position:relative}
+#rangepop{position:absolute;right:0;top:calc(100% + 6px);z-index:20;display:flex;gap:14px;
+  background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;
+  box-shadow:0 12px 32px #00000026}
+#rangepop[hidden]{display:none}
+.presets{display:flex;flex-direction:column;gap:4px;border-right:1px solid var(--line);padding-right:12px}
+.presets button{background:none;border:0;text-align:left;padding:6px 10px;border-radius:6px;font-size:13px;white-space:nowrap}
+.presets button:hover,.presets button[aria-pressed="true"]{background:var(--card)}
+.presets button[aria-pressed="true"]{color:var(--bar)}
+.calhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;font-size:14px}
+.calhead button{background:none;border:0;padding:2px 8px;font-size:16px;border-radius:6px}
+.calhead button:hover{background:var(--card)}
+.grid{display:grid;grid-template-columns:repeat(7,32px);gap:2px}
+.grid span,.grid button{font-size:12px;text-align:center;padding:6px 0;border:0;background:none;border-radius:6px;color:var(--fg)}
+.grid span{color:var(--dim)}
+.grid button:hover:not(:disabled){background:var(--card)}
+.grid button:disabled{color:var(--dim);opacity:.4;cursor:default}
+.grid button.in{background:var(--card);border-radius:0}
+.grid button.edge{background:var(--bar);color:#fff}
+.grid button.edge.start{border-radius:6px 0 0 6px}
+.grid button.edge.end{border-radius:0 6px 6px 0}
+.grid button.edge.start.end{border-radius:6px}
+.calfoot{margin-top:8px;font-size:12px;min-height:16px}
 .err{color:#dc2626;margin-top:10px;font-size:13px}
 </style>
 <main>
 <header>
   <h1 id="title">Usage Analyzer</h1>
   <span class="spacer"></span>
-  <select id="preset">
-    <option value="7">last 7 days</option>
-    <option value="30" selected>last 30 days</option>
-    <option value="90">last 90 days</option>
-    <option value="0">all time</option>
-    <option value="custom">custom range</option>
-  </select>
-  <input id="from" type="date" title="from (inclusive)">
-  <input id="to" type="date" title="to (inclusive)">
+  <div class="rangebox">
+    <button id="rangebtn" aria-haspopup="dialog" aria-expanded="false">last 30 days</button>
+    <div id="rangepop" hidden>
+      <div class="presets">
+        <button data-days="7">last 7 days</button>
+        <button data-days="30">last 30 days</button>
+        <button data-days="90">last 90 days</button>
+        <button data-days="365">last year</button>
+        <button data-days="0">all time</button>
+      </div>
+      <div class="cal">
+        <div class="calhead">
+          <button id="prevm" title="previous month">&#8249;</button>
+          <span id="calmonth"></span>
+          <button id="nextm" title="next month">&#8250;</button>
+        </div>
+        <div class="grid" id="calgrid"></div>
+        <div class="calfoot"><span id="calhint" class="muted"></span></div>
+      </div>
+    </div>
+  </div>
   <select id="who"><option value="">everyone</option></select>
   <button id="gear" title="Change what is collected">Settings</button>
 </header>
@@ -80,21 +115,30 @@ const when = s => (s||'').slice(0,16).replace('T',' ');
 const el = id => document.getElementById(id);
 let SETTINGS = {}, sort = {key:'total_tokens', desc:true};
 
-function dates(){
-  return {since: el('from').value, until: el('to').value};
-}
+let RANGE = {since:'', until:''};   // ISO days, both inclusive; '' means unbounded
+function dates(){ return RANGE; }
 function q(extra){
   const d = dates();
   const p = new URLSearchParams(Object.assign({since: d.since, until: d.until}, extra || {}));
   return p.toString();
 }
-function applyPreset(){
-  const v = el('preset').value;
-  if (v === 'custom') return;
+const iso = d => new Date(d.getTime() - d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
+const day = s => { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); };
+const nice = s => day(s).toLocaleDateString(undefined, {day:'numeric', month:'short', year:'numeric'});
+
+function setRange(since, until, label){
+  RANGE = {since, until};
+  el('rangebtn').textContent = label
+    || (since && until ? `${nice(since)} \u2013 ${nice(until)}`
+        : since ? `since ${nice(since)}` : until ? `until ${nice(until)}` : 'all time');
+}
+
+function preset(days){
   const today = new Date();
-  el('to').value = today.toISOString().slice(0,10);
-  el('from').value = v === '0' ? ''
-    : new Date(Date.now() - (+v)*864e5).toISOString().slice(0,10);
+  if (!days) return setRange('', '', 'all time');
+  const from = new Date(today.getTime() - days*864e5);
+  setRange(iso(from), iso(today),
+           days === 365 ? 'last year' : `last ${days} days`);
 }
 const api = async (p) => (await fetch(p)).json();
 
@@ -266,10 +310,66 @@ el('s_save').onclick = async () => {
   el('settings').close();
   render();
 };
-el('preset').onchange = () => { applyPreset(); render(); };
+// date range picker: presets on the left, click two days on the calendar for a custom range
+let calMonth = new Date(), picking = null;
+
+function drawCal(){
+  const first = new Date(calMonth.getFullYear(), calMonth.getMonth(), 1);
+  const days = new Date(calMonth.getFullYear(), calMonth.getMonth()+1, 0).getDate();
+  const pad = (first.getDay() + 6) % 7;   // week starts Monday
+  const today = iso(new Date());
+  el('calmonth').textContent = first.toLocaleDateString(undefined, {month:'long', year:'numeric'});
+  const cells = ['Mo','Tu','We','Th','Fr','Sa','Su'].map(d=>`<span>${d}</span>`);
+  for (let i = 0; i < pad; i++) cells.push('<span></span>');
+  for (let d = 1; d <= days; d++) {
+    const v = iso(new Date(calMonth.getFullYear(), calMonth.getMonth(), d));
+    const s = picking || RANGE.since, e = picking ? picking : RANGE.until;
+    const inRange = !picking && RANGE.since && RANGE.until && v > RANGE.since && v < RANGE.until;
+    const edge = v === s || (!picking && v === RANGE.until);
+    const cls = [inRange ? 'in' : '', edge ? 'edge' : '',
+                 v === s ? 'start' : '', (!picking && v === RANGE.until) ? 'end' : ''].join(' ');
+    cells.push(`<button data-d="${v}" class="${cls}" ${v > today ? 'disabled' : ''}>${d}</button>`);
+  }
+  el('calgrid').innerHTML = cells.join('');
+  el('calhint').textContent = picking ? `from ${nice(picking)} \u2014 now pick the end` : '';
+  el('calgrid').querySelectorAll('button[data-d]').forEach(b => b.onclick = () => {
+    const v = b.dataset.d;
+    if (!picking) { picking = v; drawCal(); return; }
+    const [a, z] = v < picking ? [v, picking] : [picking, v];
+    picking = null;
+    setRange(a, z);
+    markPreset();
+    closePop();
+    render();
+  });
+}
+
+function markPreset(){
+  el('rangepop').querySelectorAll('.presets button').forEach(b =>
+    b.setAttribute('aria-pressed', String(el('rangebtn').textContent === b.textContent)));
+}
+function openPop(){
+  picking = null;
+  calMonth = RANGE.until ? day(RANGE.until) : new Date();
+  markPreset(); drawCal();
+  el('rangepop').hidden = false;
+  el('rangebtn').setAttribute('aria-expanded', 'true');
+}
+function closePop(){
+  el('rangepop').hidden = true;
+  el('rangebtn').setAttribute('aria-expanded', 'false');
+}
+el('rangebtn').onclick = e => { e.stopPropagation(); el('rangepop').hidden ? openPop() : closePop(); };
+el('rangepop').onclick = e => e.stopPropagation();
+addEventListener('click', () => { if (!el('rangepop').hidden) closePop(); });
+addEventListener('keydown', e => { if (e.key === 'Escape') closePop(); });
+el('prevm').onclick = () => { calMonth.setMonth(calMonth.getMonth()-1); drawCal(); };
+el('nextm').onclick = () => { calMonth.setMonth(calMonth.getMonth()+1); drawCal(); };
+el('rangepop').querySelectorAll('.presets button').forEach(b => b.onclick = () => {
+  preset(+b.dataset.days); markPreset(); closePop(); render();
+});
 el('who').onchange = () => { if (location.hash.startsWith('#/u/')) location.hash = '#/'; else render(); };
-for (const id of ['from','to']) el(id).onchange = () => { el('preset').value = 'custom'; render(); };
-applyPreset();
+preset(30);
 addEventListener('hashchange', render);
 render();
 </script>
